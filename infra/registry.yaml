@@ -1,0 +1,11 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: AutoML container registry
+Resources:
+  Registry:
+    Type: AWS::ECR::Repository
+    Properties:
+      ImageTagMutability: IMMUTABLE
+      ImageScanningConfiguration: {ScanOnPush: true}
+Outputs:
+  RepositoryUri:
+    Value: !GetAtt Registry.RepositoryUri

@@ -1,0 +1,540 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Stratus AutoML - authenticated API, datasets, training, deployment and prediction
+Metadata:
+  cfn-lint:
+    config:
+      # SAM-generated usage-plan resources contain redundant DependsOn entries.
+      ignore_checks: [W3005]
+Parameters:
+  ImageUri:
+    Type: String
+    Description: ECR image URI with immutable digest (same image for Lambda and EC2)
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Public subnets in the selected VPC, with a route to an Internet Gateway
+  WorkerInstanceType:
+    Type: String
+    Default: t3.large
+  MaxWorkers:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 10
+  AllowedOrigin:
+    Type: String
+    Default: http://localhost:5173
+    Description: Frontend origin without trailing slash
+  WorkerAmi:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+  BudgetEmail:
+    Type: String
+    Default: ''
+    Description: Optional email for monthly budget alert
+Conditions:
+  HasBudgetEmail: !Not [!Equals [!Ref BudgetEmail, '']]
+Globals:
+  Function:
+    Architectures: [x86_64]
+    Timeout: 28
+    MemorySize: 1024
+    Environment:
+      Variables:
+        BUCKET_NAME: !Ref DataBucket
+        TABLE_NAME: !Ref StateTable
+        ALLOWED_ORIGIN: !Ref AllowedOrigin
+        AUTH_REQUIRED: 'true'
+        MODEL_IMAGE_URI: !Ref ImageUri
+Resources:
+  DataBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+      VersioningConfiguration: {Status: Enabled}
+      CorsConfiguration:
+        CorsRules:
+          - AllowedOrigins: [!Ref AllowedOrigin]
+            AllowedMethods: [POST]
+            AllowedHeaders: ['*']
+            ExposedHeaders: [ETag]
+            MaxAge: 900
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-staging-uploads
+            Status: Enabled
+            Prefix: uploads/
+            ExpirationInDays: 1
+            NoncurrentVersionExpiration: {NoncurrentDays: 1}
+            AbortIncompleteMultipartUpload: {DaysAfterInitiation: 1}
+  DataBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DataBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource: [!GetAtt DataBucket.Arn, !Sub '${DataBucket.Arn}/*']
+            Condition: {Bool: {'aws:SecureTransport': 'false'}}
+  StateTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: id, AttributeType: S}
+        - {AttributeName: scope, AttributeType: S}
+        - {AttributeName: created_id, AttributeType: S}
+      KeySchema: [{AttributeName: id, KeyType: HASH}]
+      GlobalSecondaryIndexes:
+        - IndexName: by-owner
+          KeySchema: [{AttributeName: scope, KeyType: HASH}, {AttributeName: created_id, KeyType: RANGE}]
+          Projection: {ProjectionType: ALL}
+      PointInTimeRecoverySpecification: {PointInTimeRecoveryEnabled: true}
+      SSESpecification: {SSEEnabled: true}
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+      VisibilityTimeout: 180
+  JobQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 3600
+      ReceiveMessageWaitTimeSeconds: 20
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt DeadLetterQueue.Arn
+        maxReceiveCount: 3
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub '${AWS::StackName}-users'
+      UsernameAttributes: [email]
+      AutoVerifiedAttributes: [email]
+      AdminCreateUserConfig: {AllowAdminCreateUserOnly: true}
+      Policies:
+        PasswordPolicy: {MinimumLength: 12, RequireLowercase: true, RequireUppercase: true, RequireNumbers: true, RequireSymbols: true}
+      AccountRecoverySetting:
+        RecoveryMechanisms: [{Name: verified_email, Priority: 1}]
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows: [code]
+      AllowedOAuthScopes: [openid, email, profile]
+      SupportedIdentityProviders: [COGNITO]
+      CallbackURLs: [!Sub '${AllowedOrigin}/auth/callback']
+      LogoutURLs: [!Ref AllowedOrigin]
+      PreventUserExistenceErrors: ENABLED
+      EnableTokenRevocation: true
+      AccessTokenValidity: 60
+      IdTokenValidity: 60
+      RefreshTokenValidity: 1
+      TokenValidityUnits: {AccessToken: minutes, IdToken: minutes, RefreshToken: days}
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Sub '${AWS::StackName}-${AWS::AccountId}'
+      UserPoolId: !Ref UserPool
+  Api:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: prod
+      EndpointConfiguration: REGIONAL
+      Cors:
+        AllowOrigin: !Sub "'${AllowedOrigin}'"
+        AllowHeaders: "'Content-Type,Authorization,X-Api-Key'"
+        AllowMethods: "'GET,POST,DELETE,OPTIONS'"
+      GatewayResponses:
+        DEFAULT_4XX:
+          ResponseParameters:
+            Headers:
+              Access-Control-Allow-Origin: !Sub "'${AllowedOrigin}'"
+              Access-Control-Allow-Headers: "'Content-Type,Authorization,X-Api-Key'"
+        DEFAULT_5XX:
+          ResponseParameters:
+            Headers:
+              Access-Control-Allow-Origin: !Sub "'${AllowedOrigin}'"
+      MethodSettings:
+        - ResourcePath: '/*'
+          HttpMethod: '*'
+          ThrottlingBurstLimit: 20
+          ThrottlingRateLimit: 10
+          MetricsEnabled: true
+      Auth:
+        DefaultAuthorizer: CognitoAuth
+        AddDefaultAuthorizerToCorsPreflight: false
+        Authorizers:
+          CognitoAuth:
+            UserPoolArn: !GetAtt UserPool.Arn
+            Identity:
+              ValidationExpression: !Ref UserPoolClient
+  Controller:
+    Type: AWS::Serverless::Function
+    Properties:
+      PackageType: Image
+      ImageUri: !Ref ImageUri
+      ImageConfig: {Command: [app.controller.handler]}
+      Environment:
+        Variables:
+          QUEUE_URL: !Ref JobQueue
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [s3:PutObject, s3:GetObject]
+              Resource: [!Sub '${DataBucket.Arn}/datasets/*', !Sub '${DataBucket.Arn}/uploads/*']
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:Query]
+              Resource: [!GetAtt StateTable.Arn, !Sub '${StateTable.Arn}/index/*']
+            - Effect: Allow
+              Action: sqs:SendMessage
+              Resource: !GetAtt JobQueue.Arn
+      Events:
+        Jobs:
+          Type: Api
+          Properties: {RestApiId: !Ref Api, Path: /jobs, Method: post}
+        Status:
+          Type: Api
+          Properties: {RestApiId: !Ref Api, Path: '/jobs/{id}', Method: get}
+        Deploy:
+          Type: Api
+          Properties: {RestApiId: !Ref Api, Path: /deploy, Method: post}
+        ListJobs:
+          Type: Api
+          Properties: {RestApiId: !Ref Api, Path: /jobs, Method: get}
+        JobActions:
+          Type: Api
+          Properties: {RestApiId: !Ref Api, Path: '/jobs/{id}/{action}', Method: post}
+        Uploads:
+          Type: Api
+          Properties: {RestApiId: !Ref Api, Path: /uploads, Method: post}
+        Datasets:
+          Type: Api
+          Properties: {RestApiId: !Ref Api, Path: /datasets, Method: get}
+        Dataset:
+          Type: Api
+          Properties: {RestApiId: !Ref Api, Path: '/datasets/{id}', Method: get}
+        DatasetAction:
+          Type: Api
+          Properties: {RestApiId: !Ref Api, Path: '/datasets/{id}/{action}', Method: post}
+        Deployments:
+          Type: Api
+          Properties: {RestApiId: !Ref Api, Path: /deployments, Method: get}
+        Deployment:
+          Type: Api
+          Properties: {RestApiId: !Ref Api, Path: '/deployments/{id}', Method: get}
+        Revoke:
+          Type: Api
+          Properties: {RestApiId: !Ref Api, Path: '/deployments/{id}', Method: delete}
+        Rotate:
+          Type: Api
+          Properties: {RestApiId: !Ref Api, Path: '/deployments/{id}/key', Method: post}
+        Health:
+          Type: Api
+          Properties: {RestApiId: !Ref Api, Path: /health, Method: get}
+  Predict:
+    Type: AWS::Serverless::Function
+    Properties:
+      PackageType: Image
+      ImageUri: !Ref ImageUri
+      ImageConfig: {Command: [app.predict.handler]}
+      MemorySize: 2048
+      EphemeralStorage: {Size: 2048}
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub '${DataBucket.Arn}/models/*'
+            - Effect: Allow
+              Action: dynamodb:GetItem
+              Resource: !GetAtt StateTable.Arn
+      Events:
+        Predict:
+          Type: Api
+          Properties:
+            RestApiId: !Ref Api
+            Path: '/predict/{id}'
+            Method: post
+            Auth: {Authorizer: NONE}
+  DlqProcessor:
+    Type: AWS::Serverless::Function
+    Properties:
+      PackageType: Image
+      ImageUri: !Ref ImageUri
+      ImageConfig: {Command: [app.dlq.handler]}
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:UpdateItem]
+              Resource: !GetAtt StateTable.Arn
+      Events:
+        DeadLetters:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt DeadLetterQueue.Arn
+            BatchSize: 10
+            FunctionResponseTypes: [ReportBatchItemFailures]
+  DlqLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${DlqProcessor}'
+      RetentionInDays: 14
+  ControllerLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${Controller}'
+      RetentionInDays: 7
+  PredictLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${Predict}'
+      RetentionInDays: 7
+  WorkerLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 7
+  WorkerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ec2.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: worker
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub '${DataBucket.Arn}/datasets/*'
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub '${DataBucket.Arn}/models/*'
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:UpdateItem]
+                Resource: !GetAtt StateTable.Arn
+              - Effect: Allow
+                Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:ChangeMessageVisibility]
+                Resource: !GetAtt JobQueue.Arn
+              - Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: '*'
+              - Effect: Allow
+                Action: [ecr:BatchGetImage, ecr:GetDownloadUrlForLayer, ecr:BatchCheckLayerAvailability]
+                Resource: !Sub 'arn:${AWS::Partition}:ecr:${AWS::Region}:${AWS::AccountId}:repository/*'
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt WorkerLogs.Arn
+              - Effect: Allow
+                Action: autoscaling:SetInstanceProtection
+                Resource: !Sub 'arn:${AWS::Partition}:autoscaling:${AWS::Region}:${AWS::AccountId}:autoScalingGroup:*:autoScalingGroupName/${AWS::StackName}-workers'
+  WorkerProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref WorkerRole]
+  WorkerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: AutoML workers - no inbound access
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 0.0.0.0/0
+  WorkerLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref WorkerAmi
+        InstanceType: !Ref WorkerInstanceType
+        IamInstanceProfile: {Arn: !GetAtt WorkerProfile.Arn}
+        MetadataOptions:
+          HttpTokens: required
+          HttpPutResponseHopLimit: 2
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs: {VolumeSize: 50, VolumeType: gp3, Encrypted: true, DeleteOnTermination: true}
+        NetworkInterfaces:
+          - DeviceIndex: 0
+            AssociatePublicIpAddress: true
+            Groups: [!Ref WorkerSecurityGroup]
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -euo pipefail
+            dnf install -y docker
+            systemctl enable --now docker
+            TOKEN=$(curl -fsS -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 21600' http://169.254.169.254/latest/api/token)
+            INSTANCE_ID=$(curl -fsS -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
+            aws ecr get-login-password --region ${AWS::Region} | docker login --username AWS --password-stdin ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com
+            docker pull ${ImageUri}
+            docker run -d --name automl-worker --restart always \
+              --log-driver awslogs --log-opt awslogs-region=${AWS::Region} \
+              --log-opt awslogs-group=${WorkerLogs} \
+              -e AWS_DEFAULT_REGION=${AWS::Region} \
+              -e BUCKET_NAME=${DataBucket} -e TABLE_NAME=${StateTable} \
+              -e QUEUE_URL=${JobQueue} \
+              -e MODEL_IMAGE_URI=${ImageUri} \
+              -e WORKER_GROUP=${AWS::StackName}-workers -e INSTANCE_ID="$INSTANCE_ID" \
+              --entrypoint python ${ImageUri} -m app.worker
+  Workers:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub '${AWS::StackName}-workers'
+      MinSize: '0'
+      MaxSize: !Ref MaxWorkers
+      DesiredCapacity: '0'
+      HealthCheckGracePeriod: 600
+      VPCZoneIdentifier: !Ref SubnetIds
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WorkerLaunchTemplate
+        Version: !GetAtt WorkerLaunchTemplate.LatestVersionNumber
+      Tags:
+        - {Key: Name, Value: !Sub '${AWS::StackName}-worker', PropagateAtLaunch: true}
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: 0
+        MaxBatchSize: 1
+        PauseTime: PT5M
+  ScaleOut:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref Workers
+      AdjustmentType: ChangeInCapacity
+      ScalingAdjustment: 1
+      Cooldown: '300'
+  ScaleToZero:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref Workers
+      AdjustmentType: ExactCapacity
+      ScalingAdjustment: 0
+      Cooldown: '300'
+  QueueHasWork:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions: [{Name: QueueName, Value: !GetAtt JobQueue.QueueName}]
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref ScaleOut]
+  QueueIdle:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      # Include in-flight jobs: a worker training a model must not look idle.
+      Metrics:
+        - Id: total
+          Expression: visible + busy
+          ReturnData: true
+        - Id: visible
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/SQS
+              MetricName: ApproximateNumberOfMessagesVisible
+              Dimensions: [{Name: QueueName, Value: !GetAtt JobQueue.QueueName}]
+            Period: 60
+            Stat: Maximum
+        - Id: busy
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/SQS
+              MetricName: ApproximateNumberOfMessagesNotVisible
+              Dimensions: [{Name: QueueName, Value: !GetAtt JobQueue.QueueName}]
+            Period: 60
+            Stat: Maximum
+      EvaluationPeriods: 15
+      Threshold: 0
+      ComparisonOperator: LessThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref ScaleToZero]
+  Budget:
+    Type: AWS::Budgets::Budget
+    Condition: HasBudgetEmail
+    Properties:
+      Budget:
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit: {Amount: 10, Unit: USD}
+      NotificationsWithSubscribers:
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 80
+            ThresholdType: PERCENTAGE
+          Subscribers: [{SubscriptionType: EMAIL, Address: !Ref BudgetEmail}]
+  QueueAgeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Training queue has waited more than 20 minutes; inspect worker launch and ECR access
+      Namespace: AWS/SQS
+      MetricName: ApproximateAgeOfOldestMessage
+      Dimensions: [{Name: QueueName, Value: !GetAtt JobQueue.QueueName}]
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 3
+      Threshold: 1200
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+  PredictErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [{Name: FunctionName, Value: !Ref Predict}]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 3
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+Outputs:
+  ApiUrl:
+    Value: !Sub 'https://${Api}.execute-api.${AWS::Region}.amazonaws.com/prod'
+  UserPoolId:
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Value: !Ref UserPoolClient
+  CognitoDomain:
+    Value: !Sub 'https://${UserPoolDomain}.auth.${AWS::Region}.amazoncognito.com'
+  BucketName:
+    Value: !Ref DataBucket
+  WorkerGroup:
+    Value: !Ref Workers
+  DeadLetterQueueUrl:
+    Value: !Ref DeadLetterQueue
+  QueueUrl:
+    Value: !Ref JobQueue
+  TableName:
+    Value: !Ref StateTable
+  WorkerLogGroup:
+    Value: !Ref WorkerLogs
+  ImageUri:
+    Value: !Ref ImageUri

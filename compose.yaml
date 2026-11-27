@@ -1,0 +1,64 @@
+x-app: &app
+  build: .
+  image: automl:local
+  platform: linux/amd64
+  entrypoint: ["python", "-m"]
+  environment:
+    AWS_DEFAULT_REGION: us-east-1
+    AWS_ACCESS_KEY_ID: test
+    AWS_SECRET_ACCESS_KEY: test
+    AWS_ENDPOINT_URL: http://localstack:4566
+    S3_PUBLIC_ENDPOINT: http://localhost:4566
+    AUTH_REQUIRED: 'false'
+    ALLOWED_ORIGIN: http://localhost:5173
+    BUCKET_NAME: automl-local
+    TABLE_NAME: automl-local
+    QUEUE_URL: http://localstack:4566/queue/us-east-1/000000000000/automl-jobs
+
+services:
+  localstack:
+    image: localstack/localstack:4.0.3
+    environment:
+      SERVICES: s3,sqs,dynamodb
+      SQS_ENDPOINT_STRATEGY: path
+    ports: ["127.0.0.1:4566:4566"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4566/_localstack/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+  init:
+    <<: *app
+    command: ["app.local", "init"]
+    depends_on:
+      localstack:
+        condition: service_healthy
+  api:
+    <<: *app
+    command: ["app.local"]
+    ports: ["127.0.0.1:8000:8000"]
+    depends_on:
+      init:
+        condition: service_completed_successfully
+  worker:
+    <<: *app
+    command: ["app.worker"]
+    depends_on:
+      init:
+        condition: service_completed_successfully
+  frontend:
+    build: ./frontend
+    ports: ["127.0.0.1:3000:80"]
+    depends_on: [api]
+  inference:
+    <<: *app
+    profiles: [lambda]
+    entrypoint: ["/lambda-entrypoint.sh"]
+    command: ["app.predict.handler"]
+    read_only: true
+    tmpfs: ["/tmp:size=2g"]
+    mem_limit: 2g
+    ports: ["127.0.0.1:9000:8080"]
+    depends_on:
+      init:
+        condition: service_completed_successfully
